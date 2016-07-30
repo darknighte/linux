@@ -1493,6 +1493,18 @@ config PRINTK
 	  very difficult to diagnose system problems, saying N here is
 	  strongly discouraged.
 
+config LOGBUFFER
+	bool "External logbuffer" if PRINTK
+	default n
+	depends on PRINTK
+	help
+	  This option enables support for an alternative, "external"
+	  printk log buffer. When enabled, an architecture- or machine-
+	  specific log buffer is used for all printk messages. This
+	  allows entities such as boot loaders to place printk-compatible
+	  messages into this buffer and for the kernel to coalesce them
+	  with its normal messages.
+
 config PRINTK_NMI
 	def_bool y
 	depends on PRINTK
