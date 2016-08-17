@@ -93,6 +93,7 @@ static int kernel_init(void *);
 extern void init_IRQ(void);
 extern void fork_init(void);
 extern void radix_tree_init(void);
+extern void setup_ext_logbuff(void);
 
 /*
  * Debug helper: via this flag we know that we are in 'early bootup code'
@@ -535,6 +536,7 @@ asmlinkage __visible void __init start_kernel(void)
 	sort_main_extable();
 	trap_init();
 	mm_init();
+	setup_ext_logbuff();
 
 	/*
 	 * Set up the scheduler prior starting any interrupts (such as the
