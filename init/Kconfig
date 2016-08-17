@@ -1493,6 +1493,18 @@ config PRINTK
 	  very difficult to diagnose system problems, saying N here is
 	  strongly discouraged.
 
+config LOGBUFFER
+	bool "External logbuffer" if PRINTK
+	default n
+	depends on PRINTK
+	help
+	  This option enables support for an alternative, "external" printk log
+	  buffer. If memory contents are preserved, e.g. after a warmboot, this
+	  provides a known location for the boot loader to read and display printk
+	  entries from the kernel.  If desired, the bootloader can write its own
+	  log entries which the kernel will display with its own log entries.
+	  Further, this capability can be used across multiple warmboot cycles.
+
 config PRINTK_NMI
 	def_bool y
 	depends on PRINTK
