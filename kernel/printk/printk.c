@@ -331,17 +331,17 @@ enum log_flags {
 };
 
 struct printk_log {
-	u64 ts_nsec;		/* timestamp in nanoseconds */
+#ifdef CONFIG_LOGBUFFER
+	u32 log_magic;		/* sanity check number */
+#endif
 	u16 len;		/* length of entire record */
 	u16 text_len;		/* length of text buffer */
 	u16 dict_len;		/* length of dictionary buffer */
 	u8 facility;		/* syslog facility */
 	u8 flags:5;		/* internal record flags */
 	u8 level:3;		/* syslog level */
+	u64 ts_nsec;		/* timestamp in nanoseconds */
 }
-#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
-__packed __aligned(4)
-#endif
 ;
 
 /*
@@ -352,7 +352,14 @@ __packed __aligned(4)
 DEFINE_RAW_SPINLOCK(logbuf_lock);
 
 /*
- * This control block collects tracking offsets for the log.
+ * This control block collects tracking offsets for the log into a single
+ * place.  It also facilitates pointing the log to another location, and,
+ * when combined with the CONFIG_LOGBUFFER feature, it allows log sharing
+ * between the bootloader and the kernel.
+ *
+ * NOTE:
+ *   By convention, the control block and the log buffer are contiguous.
+ *   This requirement can be relaxed, if desired.
  */
 struct lcb_t {
 	/* Pointer to log buffer space and length of space */
@@ -381,6 +388,15 @@ struct lcb_t {
 	/* the next printk record to read after the last 'clear' command */
 	u64 clear_seq;
 	u32 clear_idx;
+
+#ifdef CONFIG_LOGBUFFER
+	u32 log_version;
+	u32 lcb_padded_len;
+	u32 lcb_size;
+	u32 log_hdr_size;
+	phys_addr_t log_phys_addr;
+	u32 lcb_magic;
+#endif
 };
 
 #ifdef CONFIG_PRINTK
@@ -397,8 +413,26 @@ DECLARE_WAIT_QUEUE_HEAD(log_wait);
 #define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
 static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
 
+/* Log control block */
+#ifdef CONFIG_LOGBUFFER
+
+/*
+ * The bootloader may write an unexpected version/format of the log, so
+ * these values provide a way to check that the format agrees.
+ */
+#define LOGBUFF_MAGIC			0xc0de4ced
+#define LOGBUFF_LOG_VERSION		3
+#define LOGBUFF_CB_PADDED_LENGTH	1024
+
+static struct lcb_t __lcb = {
+	__log_buf, __LOG_BUF_LEN, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	LOGBUFF_LOG_VERSION, LOGBUFF_CB_PADDED_LENGTH, sizeof(struct lcb_t),
+	sizeof(struct printk_log), 0, LOGBUFF_MAGIC
+};
+#else
 static struct lcb_t __lcb = {
 	__log_buf, __LOG_BUF_LEN, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+#endif /* CONFIG_LOGBUFFER */
 
 static struct lcb_t *lcb = &__lcb;
 
@@ -596,6 +630,9 @@ static int log_store(int facility, int level,
 		msg->ts_nsec = local_clock();
 	memset(log_dict(msg) + dict_len, 0, pad_len);
 	msg->len = size;
+#ifdef CONFIG_LOGBUFFER
+	msg->log_magic = LOGBUFF_MAGIC;
+#endif
 
 	/* insert message */
 	lcb->log_next_idx += msg->len;
@@ -1069,6 +1106,21 @@ static void __init log_buf_add_cpu(void)
 #else /* !CONFIG_SMP */
 static inline void log_buf_add_cpu(void) {}
 #endif /* CONFIG_SMP */
+
+#ifdef CONFIG_LOGBUFFER
+/* Bootloader log control block address passed in on the kernel cmdline */
+phys_addr_t lcb_phys_addr __initdata;
+
+/* save requested lcb_phys_addr since it's too early to process it */
+static int __init lcb_phys_addr_setup(char *str)
+{
+	lcb_phys_addr = memparse(str, &str);
+
+	return 0;
+}
+
+early_param("lcb_phys_addr", lcb_phys_addr_setup);
+#endif
 
 void __init setup_log_buf(int early)
 {
@@ -3330,5 +3382,206 @@ void show_regs_print_info(const char *log_lvl)
 	printk("%stask: %p task.stack: %p\n",
 	       log_lvl, current, task_stack_page(current));
 }
+
+#ifdef CONFIG_LOGBUFFER
+
+static struct printk_log *log_from_idx_and_base(const char *const base,
+						const u32 idx)
+{
+	struct printk_log *msg = (struct printk_log *)(base + idx);
+
+	if (!msg->len || msg->log_magic != LOGBUFF_MAGIC)
+		return (struct printk_log *)base;
+	return msg;
+}
+
+static u32 log_next_idx_from_idx(const char *const base, const u32 idx)
+{
+	struct printk_log const *const msg = (struct printk_log *)(base + idx);
+
+	if (!msg->len || msg->log_magic != LOGBUFF_MAGIC)
+		return 0;
+	return idx + msg->len;
+}
+
+/*
+ * The bootloader may write a different version of the log than expected.
+ * So, check that the incoming lcb matches that values that the kernel
+ * expects.
+ */
+static bool is_valid_external_cb(const struct lcb_t * const new_lcb)
+{
+	/* Validate the new control buffer */
+	return (new_lcb &&
+		new_lcb->log_version == LOGBUFF_LOG_VERSION &&
+		new_lcb->lcb_magic == LOGBUFF_MAGIC &&
+		new_lcb->lcb_padded_len == LOGBUFF_CB_PADDED_LENGTH &&
+		new_lcb->lcb_size == sizeof(struct lcb_t) &&
+		new_lcb->log_hdr_size == sizeof(struct printk_log) &&
+		new_lcb->lcb_size <= new_lcb->lcb_padded_len &&
+		new_lcb->log_first_idx <= new_lcb->log_buf_len &&
+		new_lcb->log_next_idx <= new_lcb->log_buf_len &&
+		new_lcb->syslog_idx <= new_lcb->log_buf_len &&
+		new_lcb->console_idx <= new_lcb->log_buf_len &&
+		new_lcb->clear_idx <= new_lcb->log_buf_len &&
+		new_lcb->log_phys_addr != 0);
+}
+
+/*
+ * Copy the kernel log entries that have occurred so far in this boot cycle
+ * into the new log buffer location found in the log control block specified
+ * on the kernel command line. Then switch to using that location from this
+ * point onward.
+ * To ensure correctness, we must consider :
+ *  - the bootloader may be using a different structure
+ *  - size of the external buffer may not match the size of the default
+ *  - an unknown number of bootloader log entries may be present
+ *  - an unknown number of kernel log entries may be present
+ *  - wrapping of the bootloader log may have already occurred (unlikely)
+ *  - wrapping of the kernel log may have already occurred (unlikely)
+ *
+ * Memory Reservation
+ * ------------------
+ *  This feature expects the bootloader to reserve/preserve the shared buffer
+ *  memory. This reservation needs to prevent the kernel from overwriting the
+ *  external log control block and log entries. In my testing, I've used the
+ *  'fdt' commands in uboot to dynamically inject reserved memory regions via
+ *  the DT to the kernel.
+ *
+ */
+void __init setup_ext_logbuff(void)
+{
+	struct printk_log *nextblmsg, *currkmsg;
+	u64 currkmsg_seq;
+	u32 currkmsg_idx, offset_idx;
+	struct lcb_t *new_lcb;
+	unsigned long flags;
+	int ret;
+
+	if (!lcb_phys_addr)
+		return;
+
+	new_lcb = phys_to_virt(lcb_phys_addr);
+	new_lcb->log_buf = phys_to_virt(new_lcb->log_phys_addr);
+
+	/* Validate the new control buffer */
+	if (!is_valid_external_cb(new_lcb)) {
+		pr_warn("log : External log cb failed validation. Ignored\n");
+		pr_debug
+		    ("Kernel logbuffer of size %u at 0x%p (virtual address)\n",
+		     lcb->log_buf_len, lcb->log_buf);
+		return;
+	}
+
+	if (!new_log_buf_len)
+		pr_warn("log_buf_len ignored in favor of external log\n");
+
+	pr_debug
+	    ("log : Replacing cb @ 0x%p of %lu bytes with cb @ 0x%p of %d/%d bytes\n",
+	     lcb, sizeof(struct lcb_t), new_lcb, new_lcb->lcb_size,
+	     new_lcb->lcb_padded_len);
+
+	/* Capture the virtual address for the buffer */
+	new_lcb->log_buf = phys_to_virt(new_lcb->log_phys_addr);
+	pr_debug("log : Replacing buffer @ 0x%p (VA) of %d bytes with one @ 0x%p (VA) of %d bytes\n",
+		 lcb->log_buf, lcb->log_buf_len, new_lcb->log_buf,
+		 new_lcb->log_buf_len);
+
+	raw_spin_lock_irqsave(&logbuf_lock, flags);
+
+	/*
+	 * Offset sequence numbers by the number of existing bootloader msgs
+	 * NOTE: Functions above handle if the first seq becomes > than these
+	 */
+	if (lcb->syslog_seq != new_lcb->log_first_seq)
+		new_lcb->syslog_seq = lcb->syslog_seq + new_lcb->log_next_seq;
+	if (lcb->console_seq != new_lcb->log_first_seq)
+		new_lcb->console_seq = lcb->console_seq + new_lcb->log_next_seq;
+	if (lcb->clear_seq != new_lcb->log_first_seq)
+		new_lcb->clear_seq = lcb->clear_seq + new_lcb->log_next_seq;
+
+	/* Copy kernel specific data into the new/shared control block. */
+	new_lcb->syslog_prev = lcb->syslog_prev;
+	new_lcb->syslog_partial = lcb->syslog_partial;
+	new_lcb->console_prev = lcb->console_prev;
+
+	/*
+	 * Copy existing entries one at a time into the external buffer space.
+	 * The new CB will incrementally update as each kernel entry is added.
+	 * The existing CB will not be modified.
+	 */
+	for (currkmsg_seq = lcb->log_first_seq,
+	     currkmsg_idx = lcb->log_first_idx;
+	     currkmsg_seq <= lcb->log_next_seq &&
+	     currkmsg_idx < lcb->log_buf_len;
+	     currkmsg_idx = log_next(currkmsg_idx), currkmsg_seq++) {
+		currkmsg = log_from_idx_and_base(lcb->log_buf, currkmsg_idx);
+
+		/* If necessary, free bl entries to fit kernel entries */
+		while (new_lcb->log_first_seq < new_lcb->log_next_seq) {
+			u32 free;
+
+			if (new_lcb->log_next_idx > new_lcb->log_first_idx)
+				free = max(new_lcb->log_buf_len -
+					   new_lcb->log_next_idx,
+					   new_lcb->log_first_idx);
+			else
+				free = new_lcb->log_first_idx -
+				    new_lcb->log_next_idx;
+
+			if (free > currkmsg->len + sizeof(struct printk_log))
+				break;
+
+			/* Drop oldest messages until there is enough space */
+			new_lcb->log_first_idx =
+			    log_next_idx_from_idx(new_lcb->log_buf,
+						  new_lcb->log_first_idx);
+			new_lcb->log_first_seq++;
+		}
+
+		nextblmsg = (struct printk_log *)
+		    (new_lcb->log_buf + new_lcb->log_next_idx);
+
+		/* Check if the next record will fit along with a wrap record */
+		if (new_lcb->log_next_idx + currkmsg->len +
+		    sizeof(struct printk_log) >= new_lcb->log_buf_len) {
+			memset(nextblmsg, 0, sizeof(struct printk_log));
+			nextblmsg = (struct printk_log *)new_lcb->log_buf;
+			new_lcb->log_next_idx = 0;
+		}
+		/* Copy kernel message to bootloader buffer */
+		memcpy(nextblmsg, currkmsg, currkmsg->len);
+
+		/* Before moving to the next kernel entry, adjust indices */
+		if (currkmsg_seq == lcb->log_first_seq)
+			offset_idx = new_lcb->log_first_seq;
+		else
+			offset_idx = new_lcb->log_next_idx;
+
+		if (currkmsg_seq == lcb->syslog_seq)
+			new_lcb->syslog_idx = offset_idx;
+		if (currkmsg_seq == lcb->console_seq)
+			new_lcb->console_idx = offset_idx;
+		if (currkmsg_seq == lcb->clear_seq)
+			new_lcb->clear_idx = offset_idx;
+
+		/* Update next offset and sequence */
+		if (currkmsg_seq < lcb->log_next_seq) {
+			new_lcb->log_next_idx += currkmsg->len;
+			new_lcb->log_next_seq++;
+		}
+	}
+
+	/* Overwrite the default lcb pointer, buffer pointer, and length. */
+	lcb = new_lcb;
+	lcb->log_buf = (char *)new_lcb->log_buf;
+	lcb->log_buf_len = new_lcb->log_buf_len;
+
+	raw_spin_unlock_irqrestore(&logbuf_lock, flags);
+
+	pr_info("Kernel logbuffer of size %u at 0x%p (virtual address)\n",
+		lcb->log_buf_len, lcb->log_buf);
+}
+#endif
 
 #endif
